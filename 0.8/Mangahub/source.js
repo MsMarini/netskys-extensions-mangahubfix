@@ -1703,7 +1703,7 @@ var _Sources = (() => {
   var MH_API_DOMAIN = "https://api.mghcdn.com/graphql";
   var MH_CDN_DOMAIN = "https://imgx.mghcdn.com";
   var MangahubInfo = {
-    version: "3.2.1",
+    version: "3.3.0",
     name: "Mangahub",
     icon: "icon.png",
     author: "Netsky",
@@ -1743,17 +1743,28 @@ var _Sources = (() => {
         }
       });
       this.stateManager = App.createSourceStateManager();
-      // Returns ONLY the token value (the API expects the bare token in x-mhub-access,
-      // not a "mhub_access=...; Max-Age=...; Path=/" cookie string).
+      // The token currently in use. Order of trust:
+      //   1. the token we last chose (from a refresh, a bypass cookie, or a random one)
+      //   2. a fresh mhub_access cookie (e.g. from the CloudFlare bypass webview),
+      //      but never one we already know is used up
+      //   3. a brand-new random token (MangaHub accepts any 32-char hex id)
       this.getMhubAccess = async () => {
-        const cookie = this.getMhubCookie();
-        if (cookie?.value) return cookie.value;
         const stored = await this.stateManager.retrieve("mhub_key") ?? "";
         const match = /mhub_access=([^;]*)/.exec(stored);
-        return (match ? match[1] : stored) ?? "";
+        const current = (match ? match[1] : stored) ?? "";
+        if (current) return current;
+        const cookie = this.getMhubCookie();
+        const key = cookie?.value && !await this.isUsedKey(cookie.value) ? cookie.value : this.generateRandomKey();
+        await this.stateManager.store("mhub_key", key);
+        return key;
       };
       // Cache of chapter decryption keys, keyed by keyId
       this.cryptoKeys = {};
+    }
+    generateRandomKey() {
+      let key = "";
+      for (let i = 0; i < 32; i++) key += Math.floor(Math.random() * 16).toString(16);
+      return key;
     }
     getMhubCookie() {
       return this.requestManager?.cookieStore?.getAllCookies().find((x) => x.name === "mhub_access" && x.value);
@@ -1865,18 +1876,24 @@ var _Sources = (() => {
       }
       return { status: response.status, data };
     }
-    // Runs a query; if the answer is missing, an error, or not JSON (usually a used-up
-    // token), refreshes the token and retries ONCE before giving a descriptive error.
+    // Runs a query. If the answer is missing, an error, or not JSON (usually a used-up
+    // token): get a new token from the site and retry; if that still fails, switch to a
+    // brand-new random token and retry one last time.
     async apiQuery(query, isValid, what, refreshUrl) {
       let result = await this.sendQuery(query);
       if (!result.data?.errors && isValid(result.data)) return result.data;
-      await this.refreshAPIKey(refreshUrl);
+      const gotSiteKey = await this.refreshAPIKey(refreshUrl);
       result = await this.sendQuery(query);
       if (!result.data?.errors && isValid(result.data)) return result.data;
+      if (gotSiteKey) {
+        await this.useRandomKey();
+        result = await this.sendQuery(query);
+        if (!result.data?.errors && isValid(result.data)) return result.data;
+      }
       const serverMessage = result.data?.errors?.[0]?.message;
       if (serverMessage) {
         throw new Error(`MangaHub refused the request for ${what}: ${serverMessage}
-Try the CloudFlare bypass again or come back later.`);
+A new token didn't help, so this limit is probably on your connection. Switch networks (Wi-Fi/cellular) or come back later.`);
       }
       if (result.data === void 0) {
         throw new Error(`MangaHub sent an unreadable response (HTTP ${result.status}) for ${what}. You may be rate limited or need to redo the CloudFlare bypass.`);
@@ -2125,7 +2142,7 @@ Try the CloudFlare bypass again or come back later.`);
     }
     async getCloudflareBypassRequestAsync() {
       await this.stateManager.store("userAgent", "null");
-      await this.stateManager.store("mhub_key", "");
+      await this.retireCurrentKey();
       return App.createRequest({
         url: `${MH_DOMAIN}/chapter/the-last-human/chapter-1?reloadKey=1`,
         method: "GET",
@@ -2175,33 +2192,66 @@ Try the CloudFlare bypass again or come back later.`);
       if (!params?.key && !params?.keys) throw new Error("Chapter decryption key response was empty");
       return params;
     }
+    // Remembers the last 20 tokens we stopped using, so a stale cookie is never picked again
+    async getUsedKeys() {
+      try {
+        const raw = await this.stateManager.retrieve("mhub_used_keys");
+        const list = typeof raw === "string" ? JSON.parse(raw) : raw;
+        return Array.isArray(list) ? list : [];
+      } catch (e) {
+        return [];
+      }
+    }
+    async isUsedKey(key) {
+      return (await this.getUsedKeys()).includes(key);
+    }
+    async retireCurrentKey() {
+      const old = await this.getMhubAccess();
+      const used = (await this.getUsedKeys()).filter((k) => k !== old);
+      used.push(old);
+      await this.stateManager.store("mhub_used_keys", JSON.stringify(used.slice(-20)));
+      await this.stateManager.store("mhub_key", "");
+      return old;
+    }
+    async useRandomKey() {
+      await this.retireCurrentKey();
+      await this.stateManager.store("mhub_key", this.generateRandomKey());
+    }
+    // Asks the site for a new token. Returns true if the site gave us a NEW one;
+    // otherwise switches to a random token and returns false.
     async refreshAPIKey(refreshUrl) {
+      const oldKey = await this.retireCurrentKey();
       const cookieStore = this.requestManager?.cookieStore;
       cookieStore?.getAllCookies().filter((x) => x.name === "mhub_access").forEach((x) => cookieStore.removeCookie(x));
-      await this.stateManager.store("mhub_key", "");
       const pageUrl = refreshUrl ?? `${MH_DOMAIN}/chapter/the-last-human/chapter-1`;
-      const request = App.createRequest({
-        url: `${pageUrl}?reloadKey=1`,
-        method: "GET",
-        headers: {
-          "Referer": `${MH_DOMAIN}/`,
-          "User-Agent": await this.requestManager.getDefaultUserAgent()
+      const userAgent = await this.requestManager.getDefaultUserAgent();
+      for (const query of ["?reloadKey=1", ""]) {
+        let response;
+        try {
+          response = await this.requestManager.schedule(App.createRequest({
+            url: `${pageUrl}${query}`,
+            method: "GET",
+            headers: { "Referer": `${MH_DOMAIN}/`, "User-Agent": userAgent }
+          }), 1);
+        } catch (e) {
+          continue;
         }
-      });
-      const response = await this.requestManager.schedule(request, 1);
-      let mhubKey = "";
-      for (const [name, value] of Object.entries(response.headers ?? {})) {
-        if (name.toLowerCase() !== "set-cookie") continue;
-        const raw = Array.isArray(value) ? value.join("; ") : String(value);
-        const match = /mhub_access=([^;]+)/.exec(raw);
-        if (match?.[1]) mhubKey = match[1];
+        let newKey = "";
+        for (const [name, value] of Object.entries(response.headers ?? {})) {
+          if (name.toLowerCase() !== "set-cookie") continue;
+          const raw = Array.isArray(value) ? value.join("; ") : String(value);
+          const match = /mhub_access=([^;]+)/.exec(raw);
+          if (match?.[1]) newKey = match[1];
+        }
+        if (!newKey) newKey = this.getMhubCookie()?.value ?? "";
+        if (newKey && newKey !== oldKey && !await this.isUsedKey(newKey)) {
+          await this.stateManager.store("mhub_key", newKey);
+          return true;
+        }
       }
-      if (!mhubKey) mhubKey = this.getMhubCookie()?.value ?? "";
-      if (mhubKey) {
-        await this.stateManager.store("mhub_key", mhubKey);
-      } else {
-        console.log("[Mangahub] refreshAPIKey: no new mhub_access token received");
-      }
+      console.log("[Mangahub] refreshAPIKey: no new token from the site, using a random one");
+      await this.stateManager.store("mhub_key", this.generateRandomKey());
+      return false;
     }
   };
   return __toCommonJS(Mangahub_exports);
