@@ -1703,7 +1703,7 @@ var _Sources = (() => {
   var MH_API_DOMAIN = "https://api.mghcdn.com/graphql";
   var MH_CDN_DOMAIN = "https://imgx.mghcdn.com";
   var MangahubInfo = {
-    version: "3.3.0",
+    version: "3.4.0",
     name: "Mangahub",
     icon: "icon.png",
     author: "Netsky",
@@ -1723,7 +1723,7 @@ var _Sources = (() => {
     constructor() {
       this.requestManager = App.createRequestManager({
         requestsPerSecond: 2,
-        requestTimeout: 15e3,
+        requestTimeout: 2e4,
         interceptor: {
           interceptRequest: async (request) => {
             request.headers = {
@@ -1901,31 +1901,17 @@ A new token didn't help, so this limit is probably on your connection. Switch ne
       throw new Error(`MangaHub returned no data for ${what}. It may have been removed from the site.`);
     }
     async getSearchTags() {
-      const request = App.createRequest({
-        url: MH_API_DOMAIN,
-        method: "POST",
-        headers: {
-          "accept": "application/json",
-          "content-type": "application/json"
-        },
-        data: {
-          query: `query {
+      const data = await this.apiQuery(
+        `query {
                     genres {
                       id
                       slug
                       title
                     }
-                }`
-        }
-      });
-      const response = await this.requestManager.schedule(request, 1);
-      let data;
-      try {
-        data = JSON.parse(response.data);
-      } catch (e) {
-        throw new Error(`${e}`);
-      }
-      if (data.data.genres?.length == 0) throw new Error("Failed to parse genres property from data object!");
+                }`,
+        (d) => Array.isArray(d?.data?.genres) && d.data.genres.length > 0,
+        "the genre list"
+      );
       const arrayTags = [];
       for (const genre of data.data.genres) {
         arrayTags.push({ id: genre.slug, label: genre.title });
@@ -1933,15 +1919,8 @@ A new token didn't help, so this limit is probably on your connection. Switch ne
       return [App.createTagSection({ id: "0", label: "genres", tags: arrayTags.map((x) => App.createTag(x)) })];
     }
     async getHomePageSections(sectionCallback) {
-      const request = App.createRequest({
-        url: MH_API_DOMAIN,
-        method: "POST",
-        headers: {
-          "Accept": "application/json",
-          "Content-Type": "application/json"
-        },
-        data: {
-          query: `query {
+      const data = await this.apiQuery(
+        `query {
                     latest_popular: latestPopular(x: m01) {
                         id
                         title
@@ -1983,28 +1962,21 @@ A new token didn't help, so this limit is probably on your connection. Switch ne
                           latestChapter
                     }
                 }
-            }`
-        }
-      });
-      const response = await this.requestManager.schedule(request, 1);
-      try {
-        const data = JSON.parse(response.data);
-        parseHomeSections(data, sectionCallback);
-      } catch (e) {
-        throw new Error(`${e}`);
+            }`,
+        (d) => !!(d?.data && (d.data.latest_popular || d.data.latest || d.data.popular || d.data.new || d.data.completed)),
+        "the Discover page"
+      );
+      data.data.latest_popular = data.data.latest_popular ?? [];
+      data.data.latest = data.data.latest ?? [];
+      for (const key of ["popular", "new", "completed"]) {
+        data.data[key] = { rows: data.data[key]?.rows ?? [] };
       }
+      parseHomeSections(data, sectionCallback);
     }
     async getViewMoreItems(homepageSectionId, metadata) {
       const offset = metadata?.offset ?? 0;
-      const request = App.createRequest({
-        url: MH_API_DOMAIN,
-        method: "POST",
-        headers: {
-          "Accept": "application/json",
-          "Content-Type": "application/json"
-        },
-        data: {
-          query: `query {
+      const data = await this.apiQuery(
+        `query {
                     latest: search(x: m01, mod: LATEST, offset: ${offset}) {
                         rows {
                             id
@@ -2041,15 +2013,12 @@ A new token didn't help, so this limit is probably on your connection. Switch ne
                             latestChapter
                     }
                 }
-            }`
-        }
-      });
-      const response = await this.requestManager.schedule(request, 1);
-      let data;
-      try {
-        data = JSON.parse(response.data);
-      } catch (e) {
-        throw new Error(`${e}`);
+            }`,
+        (d) => !!(d?.data && (d.data.latest || d.data.popular || d.data.new || d.data.completed)),
+        "more results"
+      );
+      for (const key of ["latest", "popular", "new", "completed"]) {
+        data.data[key] = { rows: data.data[key]?.rows ?? [] };
       }
       const manga = parseViewMore(homepageSectionId, data);
       metadata = { offset: offset + 30 };
@@ -2060,74 +2029,35 @@ A new token didn't help, so this limit is probably on your connection. Switch ne
     }
     async getSearchResults(query, metadata) {
       const offset = metadata?.offset ?? 0;
-      const searchTag = query?.includedTags?.map((x) => x.id);
-      const requests = [
-        //No Alt Titles
-        {
-          request: App.createRequest({
-            url: MH_API_DOMAIN,
-            method: "POST",
-            headers: {
-              "Accept": "application/json",
-              "Content-Type": "application/json"
-            },
-            data: {
-              query: `query {
-                            search(x: m01, alt: false, q: "${query?.title ? query.title : ""}", genre: "${searchTag[0] ? searchTag[0] : ""}", offset:${offset}) {
-                              rows {
-                                id
-                                title
-                                slug
-                                image
-                                latestChapter
-                                genres
-                              }
-                            }
-                          }
-                          `
-            }
-          })
-        },
-        {
-          request: App.createRequest({
-            url: MH_API_DOMAIN,
-            method: "POST",
-            headers: {
-              "Accept": "application/json",
-              "Content-Type": "application/json"
-            },
-            data: {
-              query: `query {
-                            search(x: m01, alt: true, q: "${query?.title ? query.title : ""}", genre: "${searchTag[0] ? searchTag[0] : ""}", offset:${offset}) {
-                              rows {
-                                id
-                                title
-                                slug
-                                image
-                                latestChapter
-                                genres
-                              }
-                            }
-                          }
-                          `
-            }
-          })
-        }
-      ];
-      const promises = [];
+      const searchTag = query?.includedTags?.map((x) => x.id) ?? [];
+      const title = (query?.title ?? "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+      const genre = searchTag[0] ?? "";
       let manga = [];
-      for (const req of requests) {
-        promises.push(this.requestManager.schedule(req.request, 1).then((response) => {
-          let data;
-          try {
-            data = JSON.parse(response.data);
-          } catch (e) {
-            throw new Error(`${e}`);
-          }
+      let firstError;
+      for (const alt of [false, true]) {
+        try {
+          const data = await this.apiQuery(
+            `query {
+                            search(x: m01, alt: ${alt}, q: "${title}", genre: "${genre}", offset:${offset}) {
+                              rows {
+                                id
+                                title
+                                slug
+                                image
+                                latestChapter
+                                genres
+                              }
+                            }
+                          }`,
+            (d) => Array.isArray(d?.data?.search?.rows),
+            "search results"
+          );
           manga = manga.concat(parseSearch(data));
-        }));
+        } catch (e) {
+          firstError = firstError ?? e;
+        }
       }
-      await Promise.all(promises);
+      if (manga.length == 0 && firstError) throw firstError;
       const seen = /* @__PURE__ */ new Set();
       manga = manga.filter((x) => {
         const duplicate = seen.has(x.mangaId);
@@ -2144,7 +2074,7 @@ A new token didn't help, so this limit is probably on your connection. Switch ne
       await this.stateManager.store("userAgent", "null");
       await this.retireCurrentKey();
       return App.createRequest({
-        url: `${MH_DOMAIN}/chapter/the-last-human/chapter-1?reloadKey=1`,
+        url: `${MH_DOMAIN}/api/chapter-crypto`,
         method: "GET",
         headers: {
           "Referer": `${MH_DOMAIN}/`,
@@ -2236,6 +2166,7 @@ A new token didn't help, so this limit is probably on your connection. Switch ne
         } catch (e) {
           continue;
         }
+        if (response.status == 403 || response.status == 503) break;
         let newKey = "";
         for (const [name, value] of Object.entries(response.headers ?? {})) {
           if (name.toLowerCase() !== "set-cookie") continue;
